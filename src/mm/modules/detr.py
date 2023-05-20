@@ -1,19 +1,22 @@
 import os
+import torch
 import numpy as np
 
 from mmdet.apis import init_detector
 from mmdet.utils import get_test_pipeline_cfg
 from mmcv.transforms import Compose
 from mmdet.evaluation.functional import coco_classes
+from mmdet.models.data_preprocessors import DetDataPreprocessor
 
 from ..mmresult import Results
+from ..mmutils import build_annotations, is_list_of
 
 CFG_DICT = {
-    "m": "detr_r50_8xb2-150e_coco.py",
+    "m": "detr_medium.py",
 }
 
 CFG_B_DICT = {
-    "detr_r50_8xb2-150e_coco.py": "m",
+    "detr_meidum.py": "m",
 }
 
 def build_detr(current_directory,
@@ -56,5 +59,39 @@ def build_detr(current_directory,
             new_pred = np.array(new_pred)
             results.append(Results(orig_img=orig_img, path="./", names=class_names, boxes=new_pred))
         return results
+    
+    annotation_path = os.path.join(cfg.train_dataloader.dataset.data_root, "annotations/train.json")
+    if not os.path.exists(annotation_path):
+        build_annotations(cfg, annotation_path, class_names)
+    
+    def preprocess_batch(cls, **kwargs):
+        batch = kwargs["batch"]
+        if not hasattr(cls, "data_processor"):
+            cls.data_processor = DetDataPreprocessor(cfg.model.data_preprocessor.mean,
+                                                     cfg.model.data_preprocessor.std).to(cls.device)
+            processed_data = cls.data_processor(batch, training=True)
+            processed_data["inputs"] = processed_data["inputs"].to(cls.device)
+            processed_data["data_samples"] = [data_sample.to(cls.device) for data_sample in processed_data["data_samples"]]
+            return processed_data
+        processed_data = cls.data_processor(batch, training=True)
+        processed_data["inputs"] = processed_data["inputs"].to(cls.device)
+        processed_data["data_samples"] = [data_sample.to(cls.device) for data_sample in processed_data["data_samples"]]
+        return processed_data
+    
+    def loss_function(cls, **kwargs):
+        batch = kwargs["batch"]
+        losses = cls.model.loss(batch["inputs"], batch["data_samples"])
+        log_vars = []
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars.append([loss_name, loss_value.mean()])
+            elif is_list_of(loss_value, torch.Tensor):
+                log_vars.append(
+                    [loss_name,
+                     sum(_loss.mean() for _loss in loss_value)])
+        loss = sum(value for key, value in log_vars if 'loss' in key)
+        return loss
         
-    return model, preprocess, postprocess
+    return model, \
+           preprocess, postprocess, \
+           preprocess_batch, loss_function

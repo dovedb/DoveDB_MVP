@@ -1,31 +1,399 @@
 import re
-import yaml
+import os
+import json
 import time
 import torch
+import hashlib
 import platform
 import contextlib
 import numpy as np
 import torchvision
 from torch import device
 from pathlib import Path
-from typing import Optional
 from functools import wraps
+import pkg_resources as pkg
 import torch.nn.functional as F
+from typing import Optional, Union, Type
+from collections import abc
 
+import cv2
+import yaml
 from urllib import parse, request
 from dataclasses import dataclass
 from contextlib import contextmanager
+from PIL import Image, ExifTags, ImageOps
 from typing import Any, Dict, List, Optional, Tuple
 from fvcore.common.config import CfgNode as _CfgNode
-
 from iopath.common.file_io import HTTPURLHandler, OneDrivePathHandler, PathHandler
 from iopath.common.file_io import PathManager as PathManagerBase
 
+
+# PyTorch Multi-GPU DDP Constants
+RANK = int(os.getenv('RANK', -1))
+LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+
+PIN_MEMORY = str(os.getenv('PIN_MEMORY', True)).lower() == 'true'
 TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
 MACOS, LINUX, WINDOWS = (platform.system() == x for x in ['Darwin', 'Linux', 'Windows'])  # environment booleans
 
 PathManager = PathManagerBase()
 _CURRENT_STORAGE_STACK = []
+
+
+def is_docker() -> bool:
+    """
+    Determine if the script is running inside a Docker container.
+
+    Returns:
+        bool: True if the script is running inside a Docker container, False otherwise.
+    """
+    file = Path('/proc/self/cgroup')
+    if file.exists():
+        with open(file) as f:
+            return 'docker' in f.read()
+    else:
+        return False
+
+
+def is_colab():
+    """
+    Check if the current script is running inside a Google Colab notebook.
+
+    Returns:
+        bool: True if running inside a Colab notebook, False otherwise.
+    """
+    return 'COLAB_RELEASE_TAG' in os.environ or 'COLAB_BACKEND_VERSION' in os.environ
+
+
+def is_kaggle():
+    """
+    Check if the current script is running inside a Kaggle kernel.
+
+    Returns:
+        bool: True if running inside a Kaggle kernel, False otherwise.
+    """
+    return os.environ.get('PWD') == '/kaggle/working' and os.environ.get('KAGGLE_URL_BASE') == 'https://www.kaggle.com'
+
+
+def is_dir_writeable(dir_path: Union[str, Path]) -> bool:
+    """
+    Check if a directory is writeable.
+
+    Args:
+        dir_path (str) or (Path): The path to the directory.
+
+    Returns:
+        bool: True if the directory is writeable, False otherwise.
+    """
+    return os.access(str(dir_path), os.W_OK)
+
+
+def get_user_config_dir(sub_dir='Ultralytics'):
+    """
+    Get the user config directory.
+
+    Args:
+        sub_dir (str): The name of the subdirectory to create.
+
+    Returns:
+        Path: The path to the user config directory.
+    """
+    # Return the appropriate config directory for each operating system
+    if WINDOWS:
+        path = Path.home() / 'AppData' / 'Roaming' / sub_dir
+    elif MACOS:  # macOS
+        path = Path.home() / 'Library' / 'Application Support' / sub_dir
+    elif LINUX:
+        path = Path.home() / '.config' / sub_dir
+    else:
+        raise ValueError(f'Unsupported operating system: {platform.system()}')
+
+    # GCP and AWS lambda fix, only /tmp is writeable
+    if not is_dir_writeable(str(path.parent)):
+        path = Path('/tmp') / sub_dir
+
+    # Create the subdirectory if it does not exist
+    path.mkdir(parents=True, exist_ok=True)
+
+    return path
+
+
+USER_CONFIG_DIR = Path(os.getenv('YOLO_CONFIG_DIR', get_user_config_dir()))
+
+
+def is_pip_package(filepath: str = __name__) -> bool:
+    """
+    Determines if the file at the given filepath is part of a pip package.
+
+    Args:
+        filepath (str): The filepath to check.
+
+    Returns:
+        bool: True if the file is part of a pip package, False otherwise.
+    """
+    import importlib.util
+
+    # Get the spec for the module
+    spec = importlib.util.find_spec(filepath)
+
+    # Return whether the spec is not None and the origin is not None (indicating it is a package)
+    return spec is not None and spec.origin is not None
+
+
+def is_online() -> bool:
+    """
+    Check internet connectivity by attempting to connect to a known online host.
+
+    Returns:
+        bool: True if connection is successful, False otherwise.
+    """
+    import socket
+
+    for server in '1.1.1.1', '8.8.8.8', '223.5.5.5':  # Cloudflare, Google, AliDNS:
+        try:
+            socket.create_connection((server, 53), timeout=2)  # connect to (server, port=53)
+            return True
+        except (socket.timeout, socket.gaierror, OSError):
+            continue
+    return False
+
+
+ONLINE = is_online()
+
+
+def verify_image_label(args):
+    """Verify one image-label pair."""
+    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim = args
+    # Number (missing, found, empty, corrupt), message, segments, keypoints
+    nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, '', [], None
+    try:
+        # Verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        shape = (shape[1], shape[0])  # hw
+        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+        assert im.format.lower() in ('bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp', 'pfm'), f'invalid image format {im.format}'
+        if im.format.lower() in ('jpg', 'jpeg'):
+            with open(im_file, 'rb') as f:
+                f.seek(-2, 2)
+                if f.read() != b'\xff\xd9':  # corrupt JPEG
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                    msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+
+        # Verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            with open(lb_file) as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
+                    classes = np.array([x[0] for x in lb], dtype=np.float32)
+                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
+                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                lb = np.array(lb, dtype=np.float32)
+            nl = len(lb)
+            if nl:
+                if keypoint:
+                    assert lb.shape[1] == (5 + nkpt * ndim), f'labels require {(5 + nkpt * ndim)} columns each'
+                    assert (lb[:, 5::ndim] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                    assert (lb[:, 6::ndim] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                else:
+                    assert lb.shape[1] == 5, f'labels require 5 columns, {lb.shape[1]} columns detected'
+                    assert (lb[:, 1:] <= 1).all(), \
+                        f'non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}'
+                    assert (lb >= 0).all(), f'negative label values {lb[lb < 0]}'
+                # All labels
+                max_cls = int(lb[:, 0].max())  # max label count
+                assert max_cls <= num_cls, \
+                    f'Label class {max_cls} exceeds dataset class count {num_cls}. ' \
+                    f'Possible class labels are 0-{num_cls - 1}'
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    lb = lb[i]  # remove duplicates
+                    if segments:
+                        segments = [segments[x] for x in i]
+                    msg = f'{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed'
+            else:
+                ne = 1  # label empty
+                lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32) if keypoint else np.zeros(
+                    (0, 5), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32) if keypoint else np.zeros((0, 5), dtype=np.float32)
+        if keypoint:
+            keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
+            if ndim == 2:
+                kpt_mask = np.ones(keypoints.shape[:2], dtype=np.float32)
+                kpt_mask = np.where(keypoints[..., 0] < 0, 0.0, kpt_mask)
+                kpt_mask = np.where(keypoints[..., 1] < 0, 0.0, kpt_mask)
+                keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
+        lb = lb[:, :5]
+        return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
+        return [None, None, None, None, None, nm, nf, ne, nc, msg]
+
+
+def colorstr(*input):
+    """Colors a string https://en.wikipedia.org/wiki/ANSI_escape_code, i.e.  colorstr('blue', 'hello world')."""
+    *args, string = input if len(input) > 1 else ('blue', 'bold', input[0])  # color arguments, string
+    colors = {
+        'black': '\033[30m',  # basic colors
+        'red': '\033[31m',
+        'green': '\033[32m',
+        'yellow': '\033[33m',
+        'blue': '\033[34m',
+        'magenta': '\033[35m',
+        'cyan': '\033[36m',
+        'white': '\033[37m',
+        'bright_black': '\033[90m',  # bright colors
+        'bright_red': '\033[91m',
+        'bright_green': '\033[92m',
+        'bright_yellow': '\033[93m',
+        'bright_blue': '\033[94m',
+        'bright_magenta': '\033[95m',
+        'bright_cyan': '\033[96m',
+        'bright_white': '\033[97m',
+        'end': '\033[0m',  # misc
+        'bold': '\033[1m',
+        'underline': '\033[4m'}
+    return ''.join(colors[x] for x in args) + f'{string}' + colors['end']
+
+
+def is_dir_writeable(dir_path: Union[str, Path]) -> bool:
+    """
+    Check if a directory is writeable.
+
+    Args:
+        dir_path (str) or (Path): The path to the directory.
+
+    Returns:
+        bool: True if the directory is writeable, False otherwise.
+    """
+    return os.access(str(dir_path), os.W_OK)
+
+
+def img2label_paths(img_paths):
+    """Define label paths as a function of image paths."""
+    sa, sb = f'{os.sep}images{os.sep}', f'{os.sep}labels{os.sep}'  # /images/, /labels/ substrings
+    return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
+
+
+def get_hash(paths):
+    """Returns a single hash value of a list of paths (files or dirs)."""
+    size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))  # sizes
+    h = hashlib.sha256(str(size).encode())  # hash sizes
+    h.update(''.join(paths).encode())  # hash paths
+    return h.hexdigest()  # return hash
+
+
+for orientation in ExifTags.TAGS.keys():
+    if ExifTags.TAGS[orientation] == 'Orientation':
+        break
+
+
+def segments2boxes(segments):
+    """
+    It converts segment labels to box labels, i.e. (cls, xy1, xy2, ...) to (cls, xywh)
+
+    Args:
+      segments (list): list of segments, each segment is a list of points, each point is a list of x, y coordinates
+
+    Returns:
+      (np.ndarray): the xywh coordinates of the bounding boxes.
+    """
+    boxes = []
+    for s in segments:
+        x, y = s.T  # segment xy
+        boxes.append([x.min(), y.min(), x.max(), y.max()])  # cls, xyxy
+    return xyxy2xywh(np.array(boxes))  # cls, xywh
+
+
+def exif_size(img):
+    """Returns exif-corrected PIL size."""
+    s = img.size  # (width, height)
+    with contextlib.suppress(Exception):
+        rotation = dict(img._getexif().items())[orientation]
+        if rotation in [6, 8]:  # rotation 270 or 90
+            s = (s[1], s[0])
+    return s
+
+
+def verify_image_label(args):
+    """Verify one image-label pair."""
+    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim = args
+    # Number (missing, found, empty, corrupt), message, segments, keypoints
+    nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, '', [], None
+    try:
+        # Verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        shape = (shape[1], shape[0])  # hw
+        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+        assert im.format.lower() in ('bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp', 'pfm'), f'invalid image format {im.format}'
+        if im.format.lower() in ('jpg', 'jpeg'):
+            with open(im_file, 'rb') as f:
+                f.seek(-2, 2)
+                if f.read() != b'\xff\xd9':  # corrupt JPEG
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                    msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+
+        # Verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            with open(lb_file) as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
+                    classes = np.array([x[0] for x in lb], dtype=np.float32)
+                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
+                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                lb = np.array(lb, dtype=np.float32)
+            nl = len(lb)
+            if nl:
+                if keypoint:
+                    assert lb.shape[1] == (5 + nkpt * ndim), f'labels require {(5 + nkpt * ndim)} columns each'
+                    assert (lb[:, 5::ndim] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                    assert (lb[:, 6::ndim] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                else:
+                    assert lb.shape[1] == 5, f'labels require 5 columns, {lb.shape[1]} columns detected'
+                    assert (lb[:, 1:] <= 1).all(), \
+                        f'non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}'
+                    assert (lb >= 0).all(), f'negative label values {lb[lb < 0]}'
+                # All labels
+                max_cls = int(lb[:, 0].max())  # max label count
+                assert max_cls <= num_cls, \
+                    f'Label class {max_cls} exceeds dataset class count {num_cls}. ' \
+                    f'Possible class labels are 0-{num_cls - 1}'
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    lb = lb[i]  # remove duplicates
+                    if segments:
+                        segments = [segments[x] for x in i]
+                    msg = f'{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed'
+            else:
+                ne = 1  # label empty
+                lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32) if keypoint else np.zeros(
+                    (0, 5), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32) if keypoint else np.zeros((0, 5), dtype=np.float32)
+        if keypoint:
+            keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
+            if ndim == 2:
+                kpt_mask = np.ones(keypoints.shape[:2], dtype=np.float32)
+                kpt_mask = np.where(keypoints[..., 0] < 0, 0.0, kpt_mask)
+                kpt_mask = np.where(keypoints[..., 1] < 0, 0.0, kpt_mask)
+                keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
+        lb = lb[:, :5]
+        return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
+        return [None, None, None, None, None, nm, nf, ne, nc, msg]
+
 
 def subsample_labels(
     labels: torch.Tensor, num_samples: int, positive_fraction: float, bg_label: int
@@ -383,22 +751,6 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
     clip_boxes(boxes, img0_shape)
     return boxes
 
-def xyxy2xywh(x):
-    """
-    Convert bounding box coordinates from (x1, y1, x2, y2) format to (x, y, width, height) format.
-
-    Args:
-        x (np.ndarray) or (torch.Tensor): The input bounding box coordinates in (x1, y1, x2, y2) format.
-    Returns:
-       y (np.ndarray) or (torch.Tensor): The bounding box coordinates in (x, y, width, height) format.
-    """
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-    y[..., 0] = (x[..., 0] + x[..., 2]) / 2  # x center
-    y[..., 1] = (x[..., 1] + x[..., 3]) / 2  # y center
-    y[..., 2] = x[..., 2] - x[..., 0]  # width
-    y[..., 3] = x[..., 3] - x[..., 1]  # height
-    return y
-
 
 def xywh2xyxy(x):
     """
@@ -571,36 +923,6 @@ def non_max_suppression(
             break  # time limit exceeded
 
     return output
-
-
-class SimpleClass:
-    """
-    Ultralytics SimpleClass is a base class providing helpful string representation, error reporting, and attribute
-    access methods for easier debugging and usage.
-    """
-
-    def __str__(self):
-        """Return a human-readable string representation of the object."""
-        attr = []
-        for a in dir(self):
-            v = getattr(self, a)
-            if not callable(v) and not a.startswith('_'):
-                if isinstance(v, SimpleClass):
-                    # Display only the module and class name for subclasses
-                    s = f'{a}: {v.__module__}.{v.__class__.__name__} object'
-                else:
-                    s = f'{a}: {repr(v)}'
-                attr.append(s)
-        return f'{self.__module__}.{self.__class__.__name__} object with attributes:\n\n' + '\n'.join(attr)
-
-    def __repr__(self):
-        """Return a machine-readable string representation of the object."""
-        return self.__str__()
-
-    def __getattr__(self, attr):
-        """Custom attribute access error message with helpful information."""
-        name = self.__class__.__name__
-        raise AttributeError(f"'{name}' object has no attribute '{attr}'. See valid attributes below.\n{self.__doc__}")
     
 
 @dataclass
@@ -815,6 +1137,7 @@ def guess_model_scale(model_path):
         return re.search(r'yolov\d+([nslmx])', Path(model_path).stem).group(1)  # n, s, m, l, or x
     return ''
 
+
 def create_dummy_class(klass, dependency, message=""):
     """
     When a dependency of a class is not available, create a dummy class which throws ImportError
@@ -843,6 +1166,7 @@ def create_dummy_class(klass, dependency, message=""):
 
     return _Dummy
 
+
 def create_dummy_func(func, dependency, message=""):
     """
     When a dependency of a function is not available, create a dummy function which throws
@@ -867,6 +1191,7 @@ def create_dummy_func(func, dependency, message=""):
 
     return _dummy
 
+
 class _NewEmptyTensorOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, new_shape):
@@ -877,6 +1202,7 @@ class _NewEmptyTensorOp(torch.autograd.Function):
     def backward(ctx, grad):
         shape = ctx.shape
         return _NewEmptyTensorOp.apply(grad, shape), None
+
     
 class CfgNode(_CfgNode):
     """
@@ -949,6 +1275,7 @@ class CfgNode(_CfgNode):
         """
         # to make it show up in docs
         return super().dump(*args, **kwargs)
+
     
 try:
     from torch.fx._symbolic_trace import is_fx_tracing as is_fx_tracing_current
@@ -957,12 +1284,14 @@ try:
 except ImportError:
     tracing_current_exists = False
 
+
 try:
     from torch.fx._symbolic_trace import _orig_module_call
 
     tracing_legacy_exists = True
 except ImportError:
     tracing_legacy_exists = False
+
     
 @torch.jit.ignore
 def is_fx_tracing() -> bool:
@@ -976,6 +1305,7 @@ def is_fx_tracing() -> bool:
         # Can't find either current or legacy tracing indication code.
         # Enabling this assert_fx_safe() call regardless of tracing status.
         return False
+
     
 @torch.jit.ignore
 def is_fx_tracing_legacy() -> bool:
@@ -984,3 +1314,104 @@ def is_fx_tracing_legacy() -> bool:
     Can be useful for gating module logic that is incompatible with symbolic tracing.
     """
     return torch.nn.Module.__call__ is not _orig_module_call
+
+
+def check_version(current: str = '0.0.0',
+                  minimum: str = '0.0.0',
+                  name: str = 'version ',
+                  pinned: bool = False,
+                  hard: bool = False,
+                  verbose: bool = False) -> bool:
+    current, minimum = (pkg.parse_version(x) for x in (current, minimum))
+    result = (current == minimum) if pinned else (current >= minimum)  # bool
+    warning_message = f'WARNING ⚠️ {name}{minimum} is required by YOLOv8, but {name}{current} is currently installed'
+    if hard:
+        assert result, emojis(warning_message)  # assert min requirements met
+    if verbose and not result:
+        print(warning_message)
+    return result
+
+
+def build_annotations(cfg, annotation_path, class_names):
+    '''
+    Build annotations for training
+    '''
+    os.makedirs(os.path.dirname(annotation_path), exist_ok=True)
+    instance_id = 0
+    image_paths = filter(lambda x: os.path.splitext(x)[1] == ".jpg", 
+                            os.listdir(os.path.join(cfg.train_dataloader.dataset.data_root, "images")))
+    data_dict = {"images": [], "annotations": [], "categories": []}
+    for image_path in image_paths:
+        image = cv2.imread(os.path.join(cfg.train_dataloader.dataset.data_root, "images", image_path))
+        height, width, _ = image.shape
+        data_dict["images"].append({'file_name': image_path, 'height': height,
+                                    'width': width, 'id': int(image_path.split('.')[0])})
+        label_path = os.path.join(cfg.train_dataloader.dataset.data_root, "labels", image_path.replace("jpg", "txt"))
+        with open(label_path, 'r') as f:
+            for line in f.readlines():
+                line = line.strip().split(' ')
+                x, y, w, h = float(line[1]) * width, float(line[2]) * height, \
+                                float(line[3]) * width, float(line[4]) * height
+                data_dict["annotations"].append({'segmentation': [[]], 'area': w * h,
+                                                    'iscrowd': 0, 'image_id': int(image_path.split('.')[0]),
+                                                    'bbox': [x, y, w, h], 'category_id': int(line[0]), 
+                                                    'id': instance_id})
+                instance_id += 1
+    for i in range(80): data_dict["categories"].append({'id': i, 'name': class_names[i]})
+    json.dump(data_dict, open(annotation_path, 'w'))
+    
+
+def set_data_info(cfg, annotation_path,
+                  new_data_dir="./cache/detect",
+                  new_image_prefix="images",
+                  new_ann_file="annotations/train.json"):
+    cfg.train_dataloader.dataset.data_root = new_data_dir
+    cfg.train_dataloader.dataset.ann_file = new_ann_file
+    cfg.train_dataloader.dataset.data_prefix.img = new_image_prefix
+    cfg.train_dataloader.batch_size = 2
+    cfg.val_dataloader.dataset.data_root = new_data_dir
+    cfg.val_dataloader.dataset.ann_file = new_ann_file
+    cfg.val_dataloader.dataset.data_prefix.img = new_image_prefix
+    cfg.val_evaluator.ann_file = annotation_path
+    
+
+def is_seq_of(seq: Any,
+              expected_type: Union[Type, tuple],
+              seq_type: Type = None) -> bool:
+    """Check whether it is a sequence of some type.
+
+    Args:
+        seq (Sequence): The sequence to be checked.
+        expected_type (type or tuple): Expected type of sequence items.
+        seq_type (type, optional): Expected sequence type. Defaults to None.
+
+    Returns:
+        bool: Return True if ``seq`` is valid else False.
+
+    Examples:
+        >>> from mmengine.utils import is_seq_of
+        >>> seq = ['a', 'b', 'c']
+        >>> is_seq_of(seq, str)
+        True
+        >>> is_seq_of(seq, int)
+        False
+    """
+    if seq_type is None:
+        exp_seq_type = abc.Sequence
+    else:
+        assert isinstance(seq_type, type)
+        exp_seq_type = seq_type
+    if not isinstance(seq, exp_seq_type):
+        return False
+    for item in seq:
+        if not isinstance(item, expected_type):
+            return False
+    return True
+
+
+def is_list_of(seq, expected_type):
+    """Check whether it is a list of some type.
+
+    A partial method of :func:`is_seq_of`.
+    """
+    return is_seq_of(seq, expected_type, seq_type=list)

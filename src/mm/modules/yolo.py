@@ -20,6 +20,7 @@ from ..mmdownload import attempt_download_asset
 from ..mmutils import yaml_model_load, non_max_suppression, scale_boxes, yaml_load
 from ..mmresult import Results
 from ..mmargument import LetterBox
+from ..mmloss import Loss
 
 __all__ = [
     'DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost', 'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 
@@ -1686,32 +1687,6 @@ class BaseModel(nn.Module):
         self.load_state_dict(csd, strict=False)  # load
 
 
-def colorstr(*input):
-    """Colors a string https://en.wikipedia.org/wiki/ANSI_escape_code, i.e.  colorstr('blue', 'hello world')."""
-    *args, string = input if len(input) > 1 else ('blue', 'bold', input[0])  # color arguments, string
-    colors = {
-        'black': '\033[30m',  # basic colors
-        'red': '\033[31m',
-        'green': '\033[32m',
-        'yellow': '\033[33m',
-        'blue': '\033[34m',
-        'magenta': '\033[35m',
-        'cyan': '\033[36m',
-        'white': '\033[37m',
-        'bright_black': '\033[90m',  # bright colors
-        'bright_red': '\033[91m',
-        'bright_green': '\033[92m',
-        'bright_yellow': '\033[93m',
-        'bright_blue': '\033[94m',
-        'bright_magenta': '\033[95m',
-        'bright_cyan': '\033[96m',
-        'bright_white': '\033[97m',
-        'end': '\033[0m',  # misc
-        'bold': '\033[1m',
-        'underline': '\033[4m'}
-    return ''.join(colors[x] for x in args) + f'{string}' + colors['end']
-
-
 def make_divisible(x, divisor):
     """Returns nearest x divisible by divisor."""
     if isinstance(divisor, torch.Tensor):
@@ -2044,7 +2019,12 @@ def build_yolov(current_directory,
     
     # load weight
     if model_weight_path is not None: 
-        if "yolo" in model_name: detector, _ = load_yolov_weight(model_weight_path)
+        if "yolo" in model_name: 
+            weights, _ = load_yolov_weight(model_weight_path)
+            detector.load(weights)
+            detector.args = {k: v for k, v in weights.args.items()}  # attach args to model
+            detector.pt_path = model_weight_path  # attach *.pt file path to model
+            detector.task = "detect"
     
     def postprocess(cls, **kwargs):
         """Postprocesses predictions and returns a list of Results objects."""
@@ -2095,4 +2075,24 @@ def build_yolov(current_directory,
         img /= 255  # 0 - 255 to 0.0 - 1.0
         return img
     
-    return detector, preprocess, postprocess
+    def preprocess_batch(cls, **kwargs):
+        """Prepares input image before training.
+
+        Args:
+            im (torch.Tensor | List(np.ndarray)): (N, 3, h, w) for tensor, [(h, w, 3) x N] for list.
+        """
+        batch = kwargs['batch']
+        batch['img'] = batch['img'].to(cls.device, non_blocking=True).float() / 255
+        return batch
+    
+    def loss_function(cls, **kwargs):
+        """Computes loss."""
+        batch = kwargs['batch']
+        preds = cls.model(batch['img'])
+        if not hasattr(cls, 'loss_func'):
+            cls.loss_func = Loss(cls.model)
+        return cls.loss_func(preds, batch)[0]
+    
+    return detector, \
+           preprocess, postprocess, \
+           preprocess_batch, loss_function,

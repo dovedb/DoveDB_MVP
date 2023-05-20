@@ -10,10 +10,51 @@ from functools import lru_cache
 import cv2
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 
-from .mmutils import SimpleClass, xyxy2xywh
+def xyxy2xywh(x):
+    """
+    Convert bounding box coordinates from (x1, y1, x2, y2) format to (x, y, width, height) format.
 
+    Args:
+        x (np.ndarray) or (torch.Tensor): The input bounding box coordinates in (x1, y1, x2, y2) format.
+    Returns:
+       y (np.ndarray) or (torch.Tensor): The bounding box coordinates in (x, y, width, height) format.
+    """
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[..., 0] = (x[..., 0] + x[..., 2]) / 2  # x center
+    y[..., 1] = (x[..., 1] + x[..., 3]) / 2  # y center
+    y[..., 2] = x[..., 2] - x[..., 0]  # width
+    y[..., 3] = x[..., 3] - x[..., 1]  # height
+    return y
+
+class SimpleClass:
+    """
+    Ultralytics SimpleClass is a base class providing helpful string representation, error reporting, and attribute
+    access methods for easier debugging and usage.
+    """
+
+    def __str__(self):
+        """Return a human-readable string representation of the object."""
+        attr = []
+        for a in dir(self):
+            v = getattr(self, a)
+            if not callable(v) and not a.startswith('_'):
+                if isinstance(v, SimpleClass):
+                    # Display only the module and class name for subclasses
+                    s = f'{a}: {v.__module__}.{v.__class__.__name__} object'
+                else:
+                    s = f'{a}: {repr(v)}'
+                attr.append(s)
+        return f'{self.__module__}.{self.__class__.__name__} object with attributes:\n\n' + '\n'.join(attr)
+
+    def __repr__(self):
+        """Return a machine-readable string representation of the object."""
+        return self.__str__()
+
+    def __getattr__(self, attr):
+        """Custom attribute access error message with helpful information."""
+        name = self.__class__.__name__
+        raise AttributeError(f"'{name}' object has no attribute '{attr}'. See valid attributes below.\n{self.__doc__}")
 
 class BaseTensor(SimpleClass):
     """
