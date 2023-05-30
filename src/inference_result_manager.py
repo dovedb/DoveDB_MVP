@@ -1,37 +1,3 @@
-
-
-class InferenceResultManager(object):
-    """Inference result manager."""
-
-    def __init__(self):
-        pass
-
-    def insert_result(self, event_id, frame_id, result):
-        """Insert inference result.
-
-        Args:
-            event_id (int): Event ID.
-            frame_id (int): Frame ID.
-            result (dict): Inference result. A key-value dict that 
-                contains the inference result. Defined by the event.
-
-        Returns:
-            bool: True if success, otherwise False.
-
-        Raises:
-            ValueError: If event_id or frame_id is invalid.
-        """
-
-    def query_result(self, query):
-        """Query inference result.
-        
-        Args:
-            query (str): Query. A SQL-like string that defines the query.
-        
-        Returns:
-            list: A list of inference result.
-        """
-# TODO adapter the class structure        
 import time
 import json
 
@@ -44,7 +10,6 @@ import pandas as pd
 import prettytable
 from nebula3.data.DataObject import Value, ValueWrapper
 from nebula3.data.ResultSet import ResultSet
-
 
 # print response in table format 
 cast_as = {
@@ -85,83 +50,14 @@ def print_resp(resp: ResultSet):
     print(output_table)
 
 
-def import_video_metadata(frame_data, client):
-    query = """
-    INSERT VERTEX Frame(video_id, frame_number)
-    VALUES "{video_id}":("{video_id}", {frame_number})
-    """
-    for frame in frame_data:
-        video_id = frame['video_id']
-        frame_number = frame['frame_number']
-        insert_query = query.format(video_id=video_id, frame_number=frame_number)
-        print(insert_query) 
-        reps = client.execute(insert_query)
-        assert reps.is_succeeded(), reps.error_msg()
+class InferenceResultManager(object):
+    """Inference result manager."""
+
+    def __init__(self):
+        # query result list
+        self.eventid = None
         
-def import_video_object(object_data,client):
-    query = """
-    INSERT VERTEX Object(object_id, class)
-    VALUES "{object_id}":("{object_id}", "{class_name}")
-    """
-    for obj in object_data:
-        object_id = obj['object_id']
-        class_name = obj['class']
-        insert_query = query.format(object_id=object_id, class_name=class_name)
-        print(insert_query)
-        reps = client.execute(insert_query)
-        assert reps.is_succeeded(), reps.error_msg()
-        
-def import_bbox(object_data,client):
-    query = """
-    INSERT VERTEX Bbox(bbox_id, bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax)
-    VALUES "{bbox_id}":("{bbox_id}", {bbox_xmin}, {bbox_ymin}, {bbox_xmax}, {bbox_ymax})
-    """
-    for obj in object_data:
-        bbox_id = obj['bbox_id']
-        bbox_xmin,bbox_ymin = obj['bbox_xmin'],obj['bbox_ymin']
-        bbox_xmax,bbox_ymax = obj['bbox_xmax'],obj['bbox_ymax']
-        insert_query = query.format(bbox_id=bbox_id, bbox_xmin=bbox_xmin,
-                                    bbox_ymin=bbox_ymin,bbox_xmax=bbox_xmax,bbox_ymax=bbox_ymax)
-        print(insert_query)
-        reps = client.execute(insert_query)
-        assert reps.is_succeeded(), reps.error_msg()
-        
-def insert_bbox_frames_obj_edges(frame_conatin_bbox_data):
-    
-    query = """
-        INSERT EDGE frame_contains_object()
-        VALUES "{video_id},{frame_number}"->"{bbox_id}":()
-    """
-    for frame_conatin_bbox in frame_conatin_bbox_data:
-        video_id = frame_conatin_bbox['video_id']
-        frame_number = frame_conatin_bbox['frame_number']
-        bbox_id = frame_conatin_bbox['bbox_id']
-        insert_query = query.format(
-            video_id=video_id, frame_number=frame_number
-            ,bbox_id=bbox_id)
-        
-        print(insert_query)
-        reps = client.execute(insert_query)
-        assert reps.is_succeeded(), reps.error_msg()
-        
-def insert_object_contain_bbox(object_contain_bbox):
-    query = """
-        INSERT EDGE frame_contains_bbox()
-        VALUES "{object_id}"->"{bbox_id}":()
-    """
-    for frame_conatin_bbox in object_contain_bbox:
-        object_id = frame_conatin_bbox['object_id']
-        bbox_id = frame_conatin_bbox['bbox_id']
-        insert_query = query.format(
-            object_id=object_id,bbox_id=bbox_id)
-        
-        print(insert_query)
-        reps = client.execute(insert_query)
-        assert reps.is_succeeded(), reps.error_msg()
-        
-if __name__ == '__main__':
-    client = None
-    try:
+        # connect nebula graphdb 
         config = Config()
         config.max_connection_pool_size = 10
         # init connection pool
@@ -169,17 +65,15 @@ if __name__ == '__main__':
         assert connection_pool.init([('127.0.0.1', 9669)], config)
 
         # get session from the pool
-        client = connection_pool.get_session('root', 'nebula')
-        assert client is not None
+        self.client = connection_pool.get_session('root', 'nebula')
+        assert self.client is not None
 
         # get the result in json format
-        resp_json = client.execute_json("yield 1")
+        resp_json = self.client.execute_json("yield 1")
         json_obj = json.loads(resp_json)
-        # print(json.dumps(json_obj, indent=2, sort_keys=True))
 
-        # create space and schema
-        # espesially  The following example creates an edge type with no properties.
-        reps = client.execute(
+    def create_schema(self):
+        reps = self.client.execute(
             'CREATE SPACE  IF NOT EXISTS video_space(vid_type=FIXED_STRING(12));USE video_space;'
             'CREATE TAG IF NOT EXISTS Frame(video_id string, frame_number int);'
             'CREATE TAG Object(object_id string, class string);'
@@ -190,7 +84,126 @@ if __name__ == '__main__':
         assert reps.is_succeeded(), reps.error_msg()
         # insert data need to sleep after create schema
         time.sleep(12)
+        return reps.is_succeeded()
+    
+    def insert_video_metadata(self,frame_data):
+        query = """
+        INSERT VERTEX Frame(video_id, frame_number)
+        VALUES "{video_id}":("{video_id}", {frame_number})
+        """
+        for frame in frame_data:
+            video_id = frame['video_id']
+            frame_number = frame['frame_number']
+            insert_query = query.format(video_id=video_id, frame_number=frame_number)
+            print(insert_query) 
+            reps = self.client.execute(insert_query)
+            assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+            
+    def insert_video_object(self,object_data):
+        query = """
+        INSERT VERTEX Object(object_id, class)
+        VALUES "{object_id}":("{object_id}", "{class_name}")
+        """
+        for obj in object_data:
+            object_id = obj['object_id']
+            class_name = obj['class']
+            insert_query = query.format(object_id=object_id, class_name=class_name)
+            print(insert_query)
+            reps = self.client.execute(insert_query)
+            assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+    
+    def insert_bbox(self,object_data):
+        query = """
+        INSERT VERTEX Bbox(bbox_id, bbox_xmin, bbox_ymin, bbox_xmax, bbox_ymax)
+        VALUES "{bbox_id}":("{bbox_id}", {bbox_xmin}, {bbox_ymin}, {bbox_xmax}, {bbox_ymax})
+        """
+        for obj in object_data:
+            bbox_id = obj['bbox_id']
+            bbox_xmin,bbox_ymin = obj['bbox_xmin'],obj['bbox_ymin']
+            bbox_xmax,bbox_ymax = obj['bbox_xmax'],obj['bbox_ymax']
+            insert_query = query.format(bbox_id=bbox_id, bbox_xmin=bbox_xmin,
+                                        bbox_ymin=bbox_ymin,bbox_xmax=bbox_xmax,bbox_ymax=bbox_ymax)
+            print(insert_query)
+            reps = self.client.execute(insert_query)
+            assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+    
+    def insert_bbox_frames_obj_edges(self,frame_conatin_bbox_data):
+        
+        query = """
+            INSERT EDGE frame_contains_object()
+            VALUES "{video_id},{frame_number}"->"{bbox_id}":()
+        """
+        for frame_conatin_bbox in frame_conatin_bbox_data:
+            video_id = frame_conatin_bbox['video_id']
+            frame_number = frame_conatin_bbox['frame_number']
+            bbox_id = frame_conatin_bbox['bbox_id']
+            insert_query = query.format(
+                video_id=video_id, frame_number=frame_number
+                ,bbox_id=bbox_id)
+            
+            print(insert_query)
+            reps = self.client.execute(insert_query)
+            assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+    
+    def insert_object_contain_bbox(self,object_contain_bbox):
+        query = """
+            INSERT EDGE frame_contains_bbox()
+            VALUES "{object_id}"->"{bbox_id}":()
+        """
+        for frame_conatin_bbox in object_contain_bbox:
+            object_id = frame_conatin_bbox['object_id']
+            bbox_id = frame_conatin_bbox['bbox_id']
+            insert_query = query.format(
+                object_id=object_id,bbox_id=bbox_id)
+            
+            print(insert_query)
+            reps = self.client.execute(insert_query)
+            assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+     
+    def query_node(self,node_id):
+        query = """          
+            FETCH PROP ON Object "{node_id}" YIELD vertex as node
+        """
+        
+        query_node = query.format(
+        node_id=node_id)
+        # get node property
+        resp = self.client.execute(query_node)
+        assert resp.is_succeeded(), resp.error_msg()
+        print_resp(resp)
+        return resp.is_succeeded()
+    
+    def query_edge(self,cam_id,video_id,bbox_id):
+        query = f"""          
+            FETCH PROP ON frame_contains_object "{cam_id},{video_id}"->"{bbox_id}" YIELD edge as e
+        """
+        query_edge = query.format(
+        cam_id=cam_id,video_id=video_id,bbox_id=bbox_id)
+        # get edge property
+        resp = self.client.execute(query_edge)
+        assert resp.is_succeeded(), resp.error_msg()
+        print_resp(resp)
+        return resp.is_succeeded()
 
+    def drop_database(self):
+        """Drop the database."""
+        reps = self.client.execute('DROP SPACE video_space')
+        assert reps.is_succeeded(), reps.error_msg()
+        return reps.is_succeeded()
+
+        
+if __name__ == '__main__':
+    client = None
+    result_manager = InferenceResultManager()
+    try:
+
+        # create schema
+        result_manager.create_schema()
         # insert vertex
         # example video frames data
         video_frames = [
@@ -250,32 +263,23 @@ if __name__ == '__main__':
         ]
 
         # import video metadata
-        import_video_metadata(video_frames,client)
+        result_manager.insert_video_metadata(video_frames)
         # import bbox data
-        import_video_object(object_data,client)
+        result_manager.insert_video_object(object_data)
         # import bbox data
-        import_bbox(bbox_data,client)
+        result_manager.insert_bbox(bbox_data)
         # import edge data
-        insert_bbox_frames_obj_edges(frame_contain_obj)   
+        result_manager.insert_bbox_frames_obj_edges(frame_contain_obj)   
         # import edge data bbox object contains bbox
-        insert_object_contain_bbox(object_contain_bbox)
+        result_manager.insert_object_contain_bbox(object_contain_bbox)
         
-        # get node property
-        resp = client.execute('FETCH PROP ON Object "obj0" YIELD vertex as node')
-        assert resp.is_succeeded(), resp.error_msg()
-        print_resp(resp)
-
-        # get edge property
-        resp = client.execute('FETCH PROP ON frame_contains_object "cam0,3"->"bbox0" YIELD edge as e')
-        assert resp.is_succeeded(), resp.error_msg()
-        print_resp(resp)
-
-        # # drop space
-        resp = client.execute('DROP SPACE video_space')
-        assert resp.is_succeeded(), resp.error_msg()
-
-        print("Example finished")
-
+        # query node
+        result_manager.query_node("obj0")
+        # query edge
+        result_manager.query_edge("cam0","3","bbox0")
+        # drop database
+        result_manager.drop_database()
+        
     except Exception as x:
         import traceback
 
