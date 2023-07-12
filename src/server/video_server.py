@@ -1,6 +1,7 @@
 import cv2
 import socket
 import numpy as np
+from builtin_models.yolov5.inference import run_detect
 
 
 class VideoServer(object):
@@ -20,26 +21,29 @@ class VideoServer(object):
         client_socket, client_address = self.sock.accept()
         # Open a video writer
         count = 0
+
+        fp = open('inference_result.csv', 'w', encoding='utf8')
+        fp.write('frame_id,x1,y1,x2,y2,confidence,label\n')
         while True:
             # Receive the frame from the client
-            frame = self.receive_frame(client_socket)
+            frame = self.receive_frame(client_socket, count, fp)
             # If frame is None, it indicates the end of the video
             if frame is None:
                 break
-            # Resize the frame to half its original size
-            resized_frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
+            
             # Write the resized frame to the output video
-            cv2.imwrite(f'frames/{count}.jpg', resized_frame)
+            cv2.imwrite(f'frames/{count}.jpg', frame)
             count += 1
         # Release the video writer and close the sockets
+        fp.close()
         client_socket.close()
         self.sock.close()
 
     # Function to receive frame from the client
-    def receive_frame(self, sock):
+    def receive_frame(self, sock, frame_id, outfile):
 
-        height = 480
-        width = 640
+        height = 540
+        width = 960
 
         # Receive the size of the frame
         size_bytes = sock.recv(8)
@@ -66,6 +70,16 @@ class VideoServer(object):
             image = frame.reshape((height, width, 3))
 
             # Resize the image to half its size
-            resized_image = cv2.resize(image, (width // 2, height // 2))
-            return resized_image
+            # resized_image = cv2.resize(image, (width // 2, height // 2))
+            # return resized_image
 
+            boxes, confidences, labels = run_detect(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+            for box, confidence, label in zip(boxes, confidences, labels):
+                x1, y1, x2, y2 = map(int, box)
+                outfile.write(f'{frame_id},{x1},{y1},{x2},{y2},{confidence},{label}\n')
+            
+            return image
+
+    def register_event(self):
+        """Register an custom defined event"""
