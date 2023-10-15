@@ -15,6 +15,16 @@ git clone https://github.com/dovedb/DoveDB_MVP.git
 
 2. Ensure either `OpenGauss` or `PostgreSQL` is installed.
 
+You have two options for installing the database management system as the engine of index storage: `OpenGauss` or `PostgreSQL`. Choose the one that best suits your needs.
+
+- Option1: `OpenGauss`
+
+To install `OpenGauss`, please follow the installation instructions provided in the [official documentation](https://docs.opengauss.org/zh/docs/3.1.0/docs/installation/installation.html).
+
+- Option2: `PostgreSQL`
+
+Alternatively, you can install `PostgreSQL` by following the steps outlined in the official PostgreSQL documentation. You can find the [installation guide here](https://www.postgresql.org/download/).
+
 3. Install the necessary dependencies provided in the requirements.txt.
 ```bash
 cd src && pip install -r requirements.txt 
